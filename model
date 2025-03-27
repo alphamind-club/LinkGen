@@ -1,0 +1,350 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader
+import logging
+from google.colab import files
+from google.colab import drive
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+import random
+import os
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+# Load the CSV file with embeddings
+df = pd.read_csv('Embeddings.csv')
+
+# Add an index column to track samples
+df['Index'] = df.index
+
+# Print the first few rows and the column names for debugging
+print(df.head())
+print(f"Number of rows: {df.shape[0]}")
+print(f"Number of columns: {df.shape[1]}")
+print(df.columns)
+
+# Find the columns related to heavy chain, light chain, linker, and payload embeddings
+heavy_columns = [col for col in df.columns if col.startswith('HeavyChain')]
+light_columns = [col for col in df.columns if col.startswith('LightChain')]
+linker_columns = [col for col in df.columns if col.startswith('Linker')]
+payload_columns = [col for col in df.columns if col.startswith('Payload')]
+
+# Combine these columns into lists of embeddings
+heavy_embeddings = torch.tensor(df[heavy_columns].values, dtype=torch.float32)
+light_embeddings = torch.tensor(df[light_columns].values, dtype=torch.float32)
+linker_embeddings = torch.tensor(df[linker_columns].values, dtype=torch.float32)
+payload_embeddings = torch.tensor(df[payload_columns].values, dtype=torch.float32)
+
+# Extract index column for tracking
+indices = torch.tensor(df['Index'].values, dtype=torch.long)
+
+# Verify shapes of the embeddings
+print("Heavy embeddings shape:", heavy_embeddings.shape)
+print("Light embeddings shape:", light_embeddings.shape)
+print("Linker embeddings shape:", linker_embeddings.shape)
+print("Payload embeddings shape:", payload_embeddings.shape)
+
+class DiffusionModel(nn.Module):
+    def __init__(self, heavy_dim, light_dim, payload_dim, linker_dim, num_steps=1000):
+        super(DiffusionModel, self).__init__()
+        self.context_dim = heavy_dim + light_dim + payload_dim
+
+        # Context encoder
+        self.context_encoder = nn.Sequential(
+            nn.Linear(self.context_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256)
+        )
+        # Linker generator
+        self.linker_generator = nn.Sequential(
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, linker_dim),
+            nn.Tanh()
+        )
+        self.time_embed = nn.Sequential(
+            nn.Linear(1, 128),
+            nn.ReLU(),
+            nn.Linear(128, 256)
+        )
+    def forward(self, heavy_embedding, light_embedding, payload_embedding, x, t):
+        # Concatenate embeddings to form the context
+        context_vector = torch.cat([heavy_embedding, light_embedding, payload_embedding], dim=1)
+
+        # Encode the context
+        encoded_context = self.context_encoder(context_vector)
+
+        # Time embedding
+        time_embedded = self.time_embed(t.unsqueeze(-1).float())
+
+        # Generate novel linker embedding based on context and time
+        combined = torch.cat((encoded_context, time_embedded), dim=1)
+        linker_embedding = self.linker_generator(combined)
+
+        return linker_embedding
+
+def diffusion_loss_fn(model, x_0, heavy_embedding, light_embedding, payload_embedding, alphas_bar_sqrt, one_minus_alphas_bar_sqrt, num_steps):
+    batch_size = x_0.shape[0]
+    t = torch.randint(0, num_steps, (batch_size,), device=x_0.device).long()
+
+    # Reshape alphas_bar_sqrt and one_minus_alphas_bar_sqrt to match x_0
+    alphas_t = alphas_bar_sqrt[t].view(batch_size, 1)
+    one_minus_alphas_t = one_minus_alphas_bar_sqrt[t].view(batch_size, 1)
+
+    # Generate random noise
+    noise = torch.randn_like(x_0)
+
+    # Add noise to the data
+    x_noisy = alphas_t * x_0 + one_minus_alphas_t * noise
+
+    # Model predicts the noise
+    predicted_noise = model(heavy_embedding, light_embedding, payload_embedding, x_noisy, t.float())
+
+    # Noise prediction loss
+    noise_prediction_loss = F.mse_loss(predicted_noise, noise)
+
+    # Context embedding alignment loss
+    context_embedding_alignment_loss = F.mse_loss(x_noisy, x_0)
+
+    # Total loss
+    total_loss = noise_prediction_loss + context_embedding_alignment_loss
+
+    return total_loss, noise_prediction_loss, context_embedding_alignment_loss
+
+class ADCDataset(Dataset):
+    def __init__(self, heavy_embeddings, light_embeddings, payload_embeddings, linker_embeddings, indices):
+        self.heavy_embeddings = heavy_embeddings
+        self.light_embeddings = light_embeddings
+        self.payload_embeddings = payload_embeddings
+        self.linker_embeddings = linker_embeddings
+        self.indices = indices
+
+    def __len__(self):
+        return len(self.heavy_embeddings)
+
+    def __getitem__(self, idx):
+        return self.heavy_embeddings[idx], self.light_embeddings[idx], self.payload_embeddings[idx], self.linker_embeddings[idx], self.indices[idx]
+
+num_steps = 1000
+learning_rate = 1e-4
+num_epochs = 50
+
+train_data, val_data = train_test_split(list(zip(heavy_embeddings, light_embeddings, payload_embeddings, linker_embeddings, indices)), test_size=0.2, random_state=42)
+train_dataset = ADCDataset(*zip(*train_data))
+val_dataset = ADCDataset(*zip(*val_data))
+
+batch_size = min(32, len(train_dataset))
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size)
+
+# Calculate dimensions based on the shapes of the embeddings
+heavy_dim = heavy_embeddings.shape[1]
+light_dim = light_embeddings.shape[1]
+payload_dim = payload_embeddings.shape[1]
+linker_dim = linker_embeddings.shape[1]
+
+model = DiffusionModel(heavy_dim, light_dim, payload_dim, linker_dim, num_steps)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+betas = torch.linspace(1e-4, 0.02, num_steps)
+alphas = 1 - betas
+alphas_bar = torch.cumprod(alphas, dim=0)
+alphas_bar_sqrt = torch.sqrt(alphas_bar)
+one_minus_alphas_bar_sqrt = torch.sqrt(1 - alphas_bar)
+train_losses, train_noise_losses, train_context_losses = [], [], []
+val_losses, val_noise_losses, val_context_losses = [], [], []
+
+# Training and validation loop
+'''
+for epoch in range(num_epochs):
+    model.train()
+    total_train_loss, total_noise_loss, total_context_loss = 0, 0, 0
+    for batch in train_loader:
+        heavy_embedding, light_embedding, payload_embedding, linker_embedding, _ = [x.to('cpu') for x in batch]
+        optimizer.zero_grad()
+
+        total_loss, noise_loss, context_loss = diffusion_loss_fn(
+            model, linker_embedding, heavy_embedding, light_embedding, payload_embedding,
+            alphas_bar_sqrt, one_minus_alphas_bar_sqrt, num_steps
+        )
+
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+
+        total_train_loss += total_loss.item()
+        total_noise_loss += noise_loss.item()
+        total_context_loss += context_loss.item()
+
+    avg_train_loss = total_train_loss / len(train_loader)
+    avg_noise_loss = total_noise_loss / len(train_loader)
+    avg_context_loss = total_context_loss / len(train_loader)
+
+    train_losses.append(avg_train_loss)
+    train_noise_losses.append(avg_noise_loss)
+    train_context_losses.append(avg_context_loss)
+
+    print(f"Epoch {epoch+1}, Training Loss: {avg_train_loss}, Noise Loss: {avg_noise_loss}, Context Loss: {avg_context_loss}")
+
+    # Validation phase
+    model.eval()
+    total_val_loss, total_val_noise_loss, total_val_context_loss = 0, 0, 0
+    with torch.no_grad():
+        for batch in val_loader:
+            heavy_embedding, light_embedding, payload_embedding, linker_embedding, val_index = [x.to('cpu') for x in batch]
+
+            total_loss, noise_loss, context_loss = diffusion_loss_fn(
+                model, linker_embedding, heavy_embedding, light_embedding, payload_embedding,
+                alphas_bar_sqrt, one_minus_alphas_bar_sqrt, num_steps
+            )
+
+            total_val_loss += total_loss.item()
+            total_val_noise_loss += noise_loss.item()
+            total_val_context_loss += context_loss.item()
+
+    avg_val_loss = total_val_loss / len(val_loader)
+    avg_val_noise_loss = total_val_noise_loss / len(val_loader)
+    avg_val_context_loss = total_val_context_loss / len(val_loader)
+
+    val_losses.append(avg_val_loss)
+    val_noise_losses.append(avg_val_noise_loss)
+    val_context_losses.append(avg_val_context_loss)
+
+    print(f"Epoch {epoch+1}, Validation Loss: {avg_val_loss}, Noise Loss: {avg_val_noise_loss}, Context Loss: {avg_val_context_loss}")
+
+    torch.save(model.state_dict(), 'diffusion_model.pth')
+    logger.info("Training completed and model saved.")
+
+# Load the trained model
+model = DiffusionModel(heavy_dim, light_dim, payload_dim, linker_dim, num_steps)
+model.load_state_dict(torch.load('diffusion_model.pth'))
+model.to(torch.device('cpu'))  # Adjust to 'cuda' if using GPU
+
+def generate_linker(model, heavy_embedding, light_embedding, payload_embedding, num_steps, alphas_bar_sqrt, one_minus_alphas_bar_sqrt, linker_dim):
+    model.eval()
+    with torch.no_grad():
+        batch_size = heavy_embedding.shape[0]
+        x = torch.randn((batch_size, linker_dim)).to(heavy_embedding.device)
+
+        for t in reversed(range(num_steps)):
+            t_tensor = torch.full((batch_size,), t, device=x.device).float()
+            predicted_noise = model(heavy_embedding, light_embedding, payload_embedding, x, t_tensor)
+            alpha_bar_t = alphas_bar_sqrt[t]
+            one_minus_alpha_bar_t = one_minus_alphas_bar_sqrt[t]
+
+            x_mean, x_std = x.mean(dim=1, keepdim=True), x.std(dim=1, keepdim=True)
+            x = (x - x_mean) / (x_std + 1e-8)
+            x = torch.clamp(x, min=x_mean - 3 * x_std, max=x_mean + 3 * x_std)
+            x = (x - one_minus_alpha_bar_t * predicted_noise) / alpha_bar_t
+
+            if t > 0:
+                noise = torch.randn_like(x)
+                x += noise * torch.sqrt((1 - alpha_bar_t) / (1 - alphas_bar_sqrt[t - 1]))
+
+        # Concatenate heavy, light, payload, and linker embeddings
+        final_embedding = torch.cat([heavy_embedding, light_embedding, payload_embedding, x], dim=1)
+
+    return final_embedding
+
+
+# Select three unique validation sample indices
+val_sample_indices = list(range(len(val_dataset)))
+
+# Log information for each selected sample
+for i, val_sample_idx in enumerate(val_sample_indices):
+    selected_val_sample = val_dataset[val_sample_idx]
+    heavy_embedding, light_embedding, payload_embedding, linker_embedding, val_index = [x.unsqueeze(0) for x in selected_val_sample]
+
+    # Log information about the selected sample
+    heavy_norm = torch.norm(heavy_embedding)
+    light_norm = torch.norm(light_embedding)
+    payload_norm = torch.norm(payload_embedding)
+    linker_norm = torch.norm(linker_embedding)
+
+    print(f"Selected Validation Sample {i+1} Index: {val_index.item()}")
+    print(f"Heavy Embedding Norm: {heavy_norm:.4f}, Light Embedding Norm: {light_norm:.4f}")
+    print(f"Payload Embedding Norm: {payload_norm:.4f}, Linker Embedding Norm: {linker_norm:.4f}")
+
+    # Generate a novel linker sequence for the selected sample
+    print(f"Generating sequence for validation sample {i+1}...")
+    novel_linker = generate_linker(
+        model,
+        heavy_embedding,
+        light_embedding,
+        payload_embedding,
+        num_steps,
+        alphas_bar_sqrt,
+        one_minus_alphas_bar_sqrt,
+        linker_dim
+    )
+    novel_linker_np = novel_linker.cpu().numpy()
+    print(f"Generated novel linker embedding for sample {i+1}:")
+    print(novel_linker_np)
+
+    # Create a DataFrame for the new linker embedding
+    linker_df = pd.DataFrame(novel_linker_np)
+
+    # Append the generated linker to the combined DataFrame
+    if i == 0:
+        all_linkers_df = linker_df
+    else:
+        all_linkers_df = pd.concat([all_linkers_df, linker_df], ignore_index=True)
+
+# Define the path where you want to save the Excel file
+output_path ='Validation Linkers'
+
+# Save the combined DataFrame to the Excel file
+combined_df.to_excel(output_path, index=False)
+
+
+# Generating a new linker from an antibody outside of the dataset
+import torch
+import pandas as pd
+
+# Load the Excel file
+new_df = pd.read_excel('Novel Linker')
+print(new_df.head())
+# List to store generated linkers
+all_novel_linkers = []
+
+# Load the model
+model = DiffusionModel(heavy_dim, light_dim, payload_dim, linker_dim, num_steps)
+model.load_state_dict(torch.load('diffusion_model.pth'))
+model.to(torch.device('cpu'))  # Or 'cuda' if using GPU
+model.eval()
+
+# Iterate over each row
+with torch.no_grad():
+    for index, row in new_df.iterrows():
+        # Convert to tensor (unsqueeze to add batch dimension)
+        heavy = torch.tensor(row[heavy_columns].values, dtype=torch.float32).unsqueeze(0)
+        light = torch.tensor(row[light_columns].values, dtype=torch.float32).unsqueeze(0)
+        payload = torch.tensor(row[payload_columns].values, dtype=torch.float32).unsqueeze(0)
+
+        # Generate linker
+        linker = generate_linker(
+            model,
+            heavy,
+            light,
+            payload,
+            num_steps,
+            alphas_bar_sqrt,
+            one_minus_alphas_bar_sqrt,
+            linker_dim
+        )
+
+        # Append the output
+        all_novel_linkers.append(linker.squeeze(0).numpy())  # Remove batch dimension
+
+# Convert to DataFrame
+novel_linkers_df = pd.DataFrame(all_novel_linkers)
+
+# Save to Excel
+novel_linkers_df.to_excel('New Linker Embedding')
+print(novel_linkers_df.head())
+print("Generated linker embeddings saved.")
+
+
