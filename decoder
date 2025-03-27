@@ -1,0 +1,318 @@
+#import files
+!pip install rdkit
+import heapq
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, models
+import re
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from sklearn.model_selection import train_test_split
+from rdkit.Chem import Descriptors
+from rdkit.Chem import rdMolDescriptors as rdescriptors
+import matplotlib.pyplot as plt
+from rdkit import Chem
+from rdkit import RDLogger
+from rdkit.Chem import Draw
+from PIL import Image
+
+RDLogger.DisableLog('rdApp.*')
+
+tf.compat.v1.enable_eager_execution()
+from google.colab import drive
+drive.mount('/content/drive')
+file_path = 'Linker Embeddings.xlsx'
+
+# Load data
+df = pd.read_excel(file_path, sheet_name='Train')
+
+
+# Process embeddings and SMILES
+embeddings = df['Embeddings'].apply(lambda x: list(map(float, x.strip('[]').split(',')))).tolist()
+smiles_sequences = df['SMILES'].tolist()
+
+# Define tokenization function
+def tokenize_smiles(smiles):
+    two_char_elements = ['Cl', 'Br', 'Na', 'Ca', 'Al', 'Sc', 'Zn', 'Mn', 'Fe', 'Co', 'Ni', 'Cu', 'Mg', 'Si', 'Se', 'Te']
+    pattern = r'(' + '|'.join(re.escape(e) for e in two_char_elements) + \
+            r'|[BCNOFPSIH1+@]|[\(\)=\-\[\]\#\/\\*\.%]|[a-z]|[\d+][\+\-]+)'
+    return re.findall(pattern, smiles)
+# Create charset
+charset = sorted(set(token for smiles in smiles_sequences for token in tokenize_smiles(smiles)))
+charset.append('<STOP>')
+charset_dict = {char: idx for idx, char in enumerate(charset)}
+inverse_charset_dict = {idx: char for char, idx in charset_dict.items()}
+
+# Set maximum sequence length
+max_len = 203
+# Function to convert SMILES to token indices (instead of one-hot encoding)
+# Function to convert SMILES to token indices (instead of one-hot encoding)
+def smiles_to_token_indices(smiles, max_len, charset_dict):
+  tokens = tokenize_smiles(smiles)
+  token_indices = np.zeros((max_len,))
+  for i, token in enumerate(tokens):
+    if i < max_len:
+      token_indices[i] = charset_dict.get(token, len(charset_dict) - 1)  # Default to <STOP>
+  for i in range(len(tokens), max_len):
+    token_indices[i] = charset_dict['<STOP>']
+  return token_indices
+# Prepare the data
+
+X = np.array(embeddings)
+y = np.array([smiles_to_token_indices(smiles, max_len, charset_dict) for smiles in smiles_sequences])
+
+# Split the data into training and a temporary subset for validation and testing
+X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.2, random_state=56)  # Seed for reproducibility
+
+# Split the temporary subset into validation and testing sets
+X_val,X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=27)  # Another seed
+
+# Build and compile the decoder model
+input_dim = len(embeddings[0])
+output_dim = len(charset)
+decoder_input = layers.Input(shape=(input_dim,))
+decoded = layers.Dense(512, kernel_regularizer=tf.keras.regularizers.l2(0.01))(decoder_input)
+decoded = layers.LeakyReLU(alpha=0.01)(decoded)
+decoded = layers.Dropout(0.5)(decoded)
+decoded = layers.Dense(max_len * output_dim)(decoded)
+decoded = layers.Reshape((max_len, output_dim))(decoded)  # Output logits for each token position
+
+decoder = models.Model(inputs=decoder_input, outputs=decoded)
+
+def custom_loss_with_penalty(y_true, y_pred):
+    # Basic token-based cross-entropy loss
+    cce_loss = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)(y_true, y_pred)
+
+    # Convert predicted tokens to SMILES string using TensorFlow operations
+    predicted_indices = tf.argmax(y_pred, axis=-1)  # Shape: (batch_size, seq_length)
+
+    # Define a mapping function to convert indices to SMILES characters
+    def map_indices_to_smiles(indices):
+        # Convert indices to characters using the inverse charset dictionary
+        chars = tf.gather(list(inverse_charset_dict.values()), indices)
+        # Join characters to form SMILES strings
+        smiles = tf.strings.reduce_join(chars, axis=-1)
+        return smiles
+
+    # Apply the mapping function to the predicted indices
+    predicted_smiles = tf.map_fn(map_indices_to_smiles, predicted_indices, dtype=tf.string)
+
+    # Define a function to calculate SMILES validity penalty
+    def smiles_validity_penalty(smiles):
+        # Implement your SMILES validity check logic here
+        # For example, use RDKit to check validity and return a penalty value
+        try:
+            from rdkit import Chem
+            # print(smiles)
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                return 1.0  # Penalty for invalid SMILES
+            else:
+                return 0.0  # No penalty for valid SMILES
+        except:
+            # print('报错地点1')
+            return 1.0  # Penalty for any parsing error
+
+    # Wrap the SMILES validity penalty function for TensorFlow compatibility
+    def tf_smiles_validity_penalty(smiles):
+        return tf.py_function(smiles_validity_penalty, [smiles], tf.float32)
+
+    # Calculate validity penalty
+    validity_penalty = tf.reduce_mean(tf.map_fn(tf_smiles_validity_penalty, predicted_smiles, dtype=tf.float32))
+
+    # Combine losses
+    total_loss = cce_loss + validity_penalty
+    return total_loss
+# Custom accuracy metric for SMILES sequences
+def smiles_sequence_accuracy(y_true, y_pred):
+    # Get the predicted and true indices
+    true_indices = tf.cast(y_true, tf.int64)
+    predicted_indices = tf.argmax(y_pred, axis=-1)
+
+    # Check how many tokens match between the predicted and true SMILES
+    matches = tf.reduce_sum(tf.cast(tf.equal(true_indices, predicted_indices), tf.float32))
+    total_tokens = tf.size(true_indices, out_type=tf.int32)
+    total_tokens = tf.cast(total_tokens, tf.float32)
+
+    # Return the percentage of correctly predicted tokens
+    return matches / total_tokens
+# check ()
+def is_brackets_matched(s):
+    # Define matching brackets
+    bracket_map = {')': '(', ']': '[', '}': '{'}
+    stack = []
+
+    # Iterate over each character in a string
+    for char in s:
+        # If left bracket, put it into stack
+        if char in bracket_map.values():
+            stack.append(char)
+        # If right bracket
+        elif char in bracket_map.keys():
+            # If stack is empty
+            if not stack:
+                return False
+            # Pop the left bracket from the stack
+            top_bracket = stack.pop()
+            if top_bracket != bracket_map[char]:
+                return False
+      return not stack
+# Fixed beam search function with proper embedding conversion
+def beam_search_multiple_smiles(embedding, decoder, charset_dict, inverse_charset_dict, beam_width=5, num_smiles=10):
+    # Ensure embedding is in the correct format for TensorFlow
+    embedding = np.array(embedding, dtype=np.float32)  # Convert to float32 if it's not already
+
+    beam = [(0, [], 0)]  # (negative log likelihood, sequence of tokens, parentheses balance)
+    # print('prediction')
+
+    prediction = decoder.predict(np.array([embedding]))
+    # print('--------------')
+
+    for step in range(prediction.shape[1]):  # max_len iterations
+        new_beam = []
+        for neg_log_prob, seq, paren_balance in beam:  # Unpack three values here
+            step_logits = prediction[0, step]
+            top_token_probs = np.argsort(step_logits)[-beam_width:]
+
+            for token_idx in top_token_probs:
+                token_prob = max(step_logits[token_idx], 1e-10)
+                new_seq = seq + [token_idx]
+                new_neg_log_prob = neg_log_prob - np.log(token_prob)
+
+                token = inverse_charset_dict.get(token_idx, '<STOP>')
+                if token == '(':
+                    new_paren_balance = paren_balance + 1
+                elif token == ')':
+                    if paren_balance == 0:
+                        continue  # Skip invalid sequences where ')' is unmatched
+                    new_paren_balance = paren_balance - 1
+                else:
+                    new_paren_balance = paren_balance
+
+                heapq.heappush(new_beam, (new_neg_log_prob, new_seq, new_paren_balance))  # Push to heap
+        beam = heapq.nsmallest(beam_width, new_beam)
+
+    # Get the top sequences (up to num_smiles)
+    top_smiles = []
+    for i in range(min(num_smiles, len(beam))):
+        best_seq = beam[i][1]
+        predicted_smiles = [inverse_charset_dict.get(idx, '<STOP>') for idx in best_seq]
+        smiles_string = ''.join([token for token in predicted_smiles if token != '<STOP>'])
+        smiles_string = smiles_string.replace("+", "").replace("-", "").replace("*", "").replace("/", "")
+        if(is_brackets_matched(smiles_string)):
+            mol = Chem.MolFromSmiles(smiles_string,sanitize=True)
+
+            if mol is not None:
+                try:
+                    Chem.SanitizeMol(mol)
+                    valid_smiles = Chem.MolToSmiles(mol, isomericSmiles=True)
+                    top_smiles.append(valid_smiles)
+                except:
+                    pass
+
+            if len(top_smiles) >= num_smiles:
+                break
+
+    return top_smiles
+# Add this metric to the model
+decoder.compile(optimizer='adam', loss=custom_loss_with_penalty, metrics=[smiles_sequence_accuracy])
+
+# Train the model
+early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+history = decoder.fit(X_train, y_train, epochs=30, batch_size=32, shuffle=True, validation_data=(X_val, y_val), callbacks=[early_stopping])
+import pandas as pd
+from google.colab import drive
+drive.mount('/content/drive', force_remount = True)
+embedding_sheet_path = 'data.xlsx'
+
+# Read the sheet without headers and all rows and columns
+embedding_df = pd.read_excel(embedding_sheet_path, header=None)
+
+
+# Extract rows and columns starting from 5825
+embedding_df_subset = embedding_df.iloc[:,5824:]  # 5825 becomes 5824 for 0-indexing
+#embedding_df_subset = embedding_df.iloc[:, 5824:]
+
+print(f"Subset shape: {embedding_df_subset.shape}")
+print(embedding_df_subset.head())
+
+# Initialize a dictionary to collect SMILES for each row
+row_smiles_dict = {}
+test = 0
+
+# Iterate through rows to process embeddings
+for index, row in embedding_df_subset.iterrows():
+    if row.isnull().all():
+        print(f"Row {index + 1} is empty or contains only NaN values.")
+        continue
+
+    embedding = row.values
+
+    # Generate SMILES (even if some may be invalid)
+    valid_smiles = beam_search_multiple_smiles(
+        embedding, decoder, charset_dict, inverse_charset_dict, beam_width=5, num_smiles=10
+    )
+
+    if index == 2:
+        test = embedding
+
+    # Print whatever was returned
+    print(f"Row {index + 1}:")
+    for smi in valid_smiles:
+        print(smi)
+
+    # Store in dictionary
+    row_smiles_dict[f"Row {index + 1}"] = valid_smiles
+#Draw a molecular structure diagram of effective SMILES
+def save_smiles_image(row_smiles_dict):
+    output_dir = ''
+    i = 0
+    for row, smiles_list in row_smiles_dict.items():
+        #print(f"Processing {row}:")
+        if smiles_list:
+            for j, smiles in enumerate(smiles_list, start=1):
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is not None:
+                    i = i + 1
+                    print(f"  SMILES {i}: {smiles} is valid.")
+
+                    filename = "Linker{:02d}.png".format(i)
+                    output_path = filename
+                    img = Draw.MolToImage(mol,size=(150,150),kekulize=True)
+                    img.save(output_path)
+# Plot the training and validation loss and accuracy
+def plot_training_history(history):
+    # Extract metrics from history
+    loss = history.history['loss']
+    val_loss = history.history['val_loss']
+    accuracy = history.history['smiles_sequence_accuracy']
+    val_accuracy = history.history['val_smiles_sequence_accuracy']
+
+    epochs = range(1, len(loss) + 1)
+
+    # Plot loss
+    plt.figure(figsize=(12, 6))
+
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, loss, 'b-', label='Training Loss')
+    plt.plot(epochs, val_loss, 'r-', label='Validation Loss')
+    plt.title('Training and Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+
+    # Plot accuracy
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, accuracy, 'b-', label='Training Accuracy')
+    plt.plot(epochs, val_accuracy, 'r-', label='Validation Accuracy')
+    plt.title('Training and Validation Accuracy')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy')
+    plt.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+# Call the function to plot the history
+plot_training_history(history)
